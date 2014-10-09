@@ -33,6 +33,8 @@
 #include <assert.h>
 #include <dirent.h>
 
+#include <array>
+
 #include "server.hpp"
 #include "colors.hpp"
 #include "stream.hpp"
@@ -80,7 +82,7 @@ struct Session {
     int internal_state;
     long id;                     // not used
 
-    struct Front * front;
+    Front * front;
 
     SessionManager * acl;
 
@@ -123,11 +125,14 @@ struct Session {
                 LOG(LOG_INFO, "Session::session_main_loop() starting");
             }
 
-            time_t start_time = time(NULL);
+            const time_t start_time = time(NULL);
 
-            struct timeval time_mark = { 3, 0 };
+            const timeval time_mark = { 3, 0 };
 
             bool run_session = true;
+
+            constexpr std::array<unsigned, 4> timers{{ 30*60, 10*60, 5*60, 1*60, }};
+            unsigned osd_state = timers.size();
 
             while (run_session) {
                 unsigned max = 0;
@@ -136,7 +141,7 @@ struct Session {
 
                 FD_ZERO(&rfds);
                 FD_ZERO(&wfds);
-                struct timeval timeout = time_mark;
+                timeval timeout = time_mark;
 
                 front_event.add_to_fd_set(rfds, max, timeout);
                 if (this->front->capture) {
@@ -231,10 +236,20 @@ struct Session {
                                                                                 );
                                     this->ptr_auth_event = new wait_obj(this->ptr_auth_trans);
                                     this->acl = new SessionManager( *this->ini
+                                                                  , *front
                                                                   , *this->ptr_auth_trans
                                                                   , start_time // proxy start time
                                                                   , now        // acl start time
                                                                   );
+                                    osd_state = [&](uint32_t enddata) -> unsigned {
+                                        if (!enddata || enddata <= start_time) {
+                                            return timers.size();
+                                        }
+                                        unsigned i = timers.rend() - std::lower_bound(
+                                            timers.rbegin(), timers.rend(), enddata - start_time
+                                        );
+                                        return i ? i-1 : 0;
+                                    }(this->ini->context.end_date_cnx.get());
                                     signal = BACK_EVENT_NEXT;
                                 }
                                 catch (...) {
@@ -246,6 +261,23 @@ struct Session {
                             if (this->ptr_auth_event->is_set(rfds)) {
                                 // acl received updated values
                                 this->acl->receive();
+                            }
+                        }
+
+                        {
+                            const uint32_t enddate = this->ini->context.end_date_cnx.get();
+                            if (enddate
+                            && osd_state < timers.size()
+                            && enddate - now <= timers[osd_state]
+                            && mm.is_up_and_running()) {
+                                std::string mes;
+                                mes.reserve(128);
+                                mes += TR("connection_closed", *this->ini);
+                                mes += " : ";
+                                mes += std::to_string((enddate - now + 30) / 60);
+                                mes += TR("minutes", *this->ini);
+                                mm.osd_message(mes);
+                                ++osd_state;
                             }
                         }
 
